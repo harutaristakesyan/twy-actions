@@ -32,30 +32,6 @@ on:
         type: string
         required: false
         default: '.'
-      # Optional: enable AWS CodeArtifact (for private packages)
-      use_codeartifact:
-        type: boolean
-        required: false
-        default: true
-      ca_domain:
-        type: string
-        required: false
-        default: finriskai
-      ca_domain_owner: # AWS Account ID that owns the CodeArtifact domain
-        type: string
-        required: false
-      ca_repository:
-        type: string
-        required: false
-        default: npm-packages
-      ca_region:
-        type: string
-        required: false
-        default: us-east-1
-      ca_scope: # e.g. @finrisk (optional)
-        type: string
-        required: false
-        default: ''
       # Deploy environments config (JSON array of objects)
       # Example: [{"name": "dev", "account_id": "123", "region": "us-east-1"}, {"name": "prod", "account_id": "456", "region": "us-west-2"}]
       environments:
@@ -80,29 +56,6 @@ jobs:
           node-version: ${{ inputs.node_version }}
           cache: 'npm'
           cache-dependency-path: ${{ inputs.workdir }}/package-lock.json
-
-      - name: Configure AWS Credentials for CodeArtifact
-        if: ${{ inputs.use_codeartifact }}
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: arn:aws:iam::${{ inputs.ca_domain_owner }}:role/github-deploy-role
-          aws-region: ${{ inputs.ca_region }}
-
-      - name: CodeArtifact login (npm)
-        if: ${{ inputs.use_codeartifact }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          aws codeartifact login --tool npm \
-            --domain "${{ inputs.ca_domain }}" \
-            --domain-owner "${{ inputs.ca_domain_owner }}" \
-            --repository "${{ inputs.ca_repository }}" \
-            --region "${{ inputs.ca_region }}"
-          if [ -f "$HOME/.npmrc" ]; then
-            cp "$HOME/.npmrc" ${{ inputs.workdir }}/.npmrc
-          else
-            echo "⚠️ ~/.npmrc not found"
-          fi
 
       - name: Cache node_modules
         id: cache-node-modules
