@@ -1,0 +1,86 @@
+name: publish-library (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        type: string
+        required: false
+        default: '20'
+      install_cmd:
+        type: string
+        required: false
+        default: 'npm ci'
+      workdir:
+        type: string
+        required: false
+        default: '.'
+      use_codeartifact:
+        type: boolean
+        required: false
+        default: true
+      ca_domain:
+        type: string
+        required: false
+        default: finriskai
+      ca_domain_owner: # AWS Account ID that owns the CodeArtifact domain
+        type: string
+        required: false
+      ca_repository:
+        type: string
+        required: false
+        default: npm-packages
+      ca_region:
+        type: string
+        required: false
+        default: us-east-1
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ inputs.workdir }}/package-lock.json
+
+      - name: Configure AWS Credentials for CodeArtifact
+        if: ${{ inputs.use_codeartifact }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.ca_domain_owner }}:role/github-deploy-role
+          aws-region: ${{ inputs.ca_region }}
+
+      - name: CodeArtifact login (npm)
+        if: ${{ inputs.use_codeartifact }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws codeartifact login --tool npm \
+            --domain "${{ inputs.ca_domain }}" \
+            --domain-owner "${{ inputs.ca_domain_owner }}" \
+            --repository "${{ inputs.ca_repository }}" \
+            --region "${{ inputs.ca_region }}"
+          echo "✅ Logged into CodeArtifact"
+          if [ -f "$HOME/.npmrc" ]; then
+            cp "$HOME/.npmrc" ${{ inputs.workdir }}/.npmrc
+          else
+            echo "⚠️ ~/.npmrc not found"
+          fi
+
+      - name: Install dependencies
+        run: ${{ inputs.install_cmd }}
+        working-directory: ${{ inputs.workdir }}
+
+      - name: Publish to CodeArtifact
+        run: npm publish
+        working-directory: ${{ inputs.workdir }}

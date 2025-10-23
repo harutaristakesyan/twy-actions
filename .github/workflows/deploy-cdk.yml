@@ -1,0 +1,209 @@
+name: deploy-cdk (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      node_version:
+        type: string
+        required: false
+        default: '20'
+      install_cmd:
+        type: string
+        required: false
+        default: 'npm ci'
+      build_cmd:
+        type: string
+        required: false
+        default: 'npm run build'
+      migrate_cmd:
+        type: string
+        required: false
+        default: 'npm run migrate'
+      cdk_args:
+        type: string
+        required: false
+        default: '--all --require-approval never'
+      run_migrations:
+        type: boolean
+        required: false
+        default: false
+      # Optional: path where your CDK project lives (e.g., "infrastructure/cdk")
+      workdir:
+        type: string
+        required: false
+        default: '.'
+      # Optional: enable AWS CodeArtifact (for private packages)
+      use_codeartifact:
+        type: boolean
+        required: false
+        default: true
+      ca_domain:
+        type: string
+        required: false
+        default: finriskai
+      ca_domain_owner: # AWS Account ID that owns the CodeArtifact domain
+        type: string
+        required: false
+      ca_repository:
+        type: string
+        required: false
+        default: npm-packages
+      ca_region:
+        type: string
+        required: false
+        default: us-east-1
+      ca_scope: # e.g. @finrisk (optional)
+        type: string
+        required: false
+        default: ''
+      # Deploy environments config (JSON array of objects)
+      # Example: [{"name": "dev", "account_id": "123", "region": "us-east-1"}, {"name": "prod", "account_id": "456", "region": "us-west-2"}]
+      environments:
+        type: string
+        required: true
+        description: 'JSON array of environment configs with name, account_id, and region'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+          cache: 'npm'
+          cache-dependency-path: ${{ inputs.workdir }}/package-lock.json
+
+      - name: Configure AWS Credentials for CodeArtifact
+        if: ${{ inputs.use_codeartifact }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ inputs.ca_domain_owner }}:role/github-deploy-role
+          aws-region: ${{ inputs.ca_region }}
+
+      - name: CodeArtifact login (npm)
+        if: ${{ inputs.use_codeartifact }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          aws codeartifact login --tool npm \
+            --domain "${{ inputs.ca_domain }}" \
+            --domain-owner "${{ inputs.ca_domain_owner }}" \
+            --repository "${{ inputs.ca_repository }}" \
+            --region "${{ inputs.ca_region }}"
+          if [ -f "$HOME/.npmrc" ]; then
+            cp "$HOME/.npmrc" ${{ inputs.workdir }}/.npmrc
+          else
+            echo "⚠️ ~/.npmrc not found"
+          fi
+
+      - name: Cache node_modules
+        id: cache-node-modules
+        uses: actions/cache@v4
+        with:
+          path: ${{ inputs.workdir }}/node_modules
+          key: node_modules-${{ runner.os }}-${{ hashFiles(format('{0}/package-lock.json', inputs.workdir)) }}
+
+      - name: Install dependencies
+        if: steps.cache-node-modules.outputs.cache-hit != 'true'
+        run: ${{ inputs.install_cmd }}
+        working-directory: ${{ inputs.workdir }}
+
+  build:
+    needs: install
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ inputs.workdir }}/node_modules
+          key: node_modules-${{ runner.os }}-${{ hashFiles(format('{0}/package-lock.json', inputs.workdir)) }}
+          fail-on-cache-miss: true
+
+      - name: Build CDK project
+        run: ${{ inputs.build_cmd }}
+        working-directory: ${{ inputs.workdir }}
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-artifacts
+          path: |
+            ${{ inputs.workdir }}
+            !${{ inputs.workdir }}/node_modules
+          retention-days: 1
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: ${{ fromJSON(inputs.environments) }}
+    environment: ${{ matrix.environment.name }}
+    concurrency:
+      group: deploy-${{ matrix.environment.name }}-${{ github.ref }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node_version }}
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ inputs.workdir }}/node_modules
+          key: node_modules-${{ runner.os }}-${{ hashFiles(format('{0}/package-lock.json', inputs.workdir)) }}
+          fail-on-cache-miss: true
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: build-artifacts
+          path: ${{ inputs.workdir }}
+
+      - name: Configure AWS Credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ matrix.environment.account_id }}:role/github-deploy-role
+          aws-region: ${{ matrix.environment.region }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Run DB Migrations (optional)
+        if: ${{ inputs.run_migrations }}
+        run: ${{ inputs.migrate_cmd }}
+        working-directory: ${{ inputs.workdir }}
+        env:
+          ENV: ${{ matrix.environment.name }}
+          ACCOUNT_ID: ${{ matrix.environment.account_id }}
+          AWS_REGION: ${{ matrix.environment.region }}
+
+      - name: Deploy CDK
+        run: npx cdk deploy ${{ inputs.cdk_args }}
+        working-directory: ${{ inputs.workdir }}
+        env:
+          ENV: ${{ matrix.environment.name }}
+          ACCOUNT_ID: ${{ matrix.environment.account_id }}
+          AWS_REGION: ${{ matrix.environment.region }}
